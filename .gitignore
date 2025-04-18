@@ -1,0 +1,33 @@
+# Base de datos SQLite
+proxy.db
+*.db
+
+# Archivos binarios compilados
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Archivos temporales
+*.tmp
+*.temp
+*.swp
+*.bak
+
+# Directorios de compilación
+/bin/
+/build/
+/out/
+
+# Dependencias y caché de Go
+/vendor/
+/go.sum
+/.cache/
+
+# Logs
+*.log
+
+# Archivos de configuración local
+/.env
+/.env.local 
