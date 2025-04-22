@@ -104,13 +104,13 @@ func getDrivers(c *gin.Context) {
 	c.JSON(http.StatusOK, response)
 }
 
-func autoPopulateDriversIfNeeded() {
+func autoPopulateDriversIfNeeded() error {
 	var count int64
 	db.Model(&Driver{}).Count(&count)
 
 	if count > 0 {
 		log.Println("✔️ Tabla de pilotos ya tiene datos.")
-		return
+		return nil
 	}
 
 	log.Println("📥 Poblando tabla de pilotos desde OpenF1...")
@@ -125,7 +125,7 @@ func autoPopulateDriversIfNeeded() {
 	// Obtener pilotos principales de session_key 9574
 	mainDrivers, err := fetchSpecificDriversFromOpenF1(9574, mainDriverNums)
 	if err != nil {
-		log.Printf("❌ Error obteniendo pilotos principales: %v", err)
+		return fmt.Errorf("error obteniendo pilotos principales: %w", err)
 	} else {
 		log.Printf("✅ Obtenidos %d pilotos principales", len(mainDrivers))
 		allDrivers = append(allDrivers, mainDrivers...)
@@ -145,12 +145,13 @@ func autoPopulateDriversIfNeeded() {
 		result := db.CreateInBatches(allDrivers, len(allDrivers))
 		if result.Error != nil {
 			log.Printf("❌ Error insertando pilotos: %v", result.Error)
-			return
+
 		}
 		log.Printf("✅ %d pilotos insertados en la base de datos.", len(allDrivers))
 	} else {
 		log.Printf("❌ No se encontraron pilotos para insertar.")
 	}
+	return nil
 }
 
 func fetchSpecificDriversFromOpenF1(sessionKey int, driverNumbers []uint) ([]Driver, error) {
@@ -427,13 +428,13 @@ func fetchWithRetry(url string, maxRetries int) ([]byte, error) {
 	return nil, fmt.Errorf("error después de %d intentos: %v", maxRetries, err)
 }
 
-func autoPopulateSessionsIfNeeded() {
+func autoPopulateSessionsIfNeeded() error {
 	var count int64
 	db.Model(&Session{}).Count(&count)
 
 	if count > 0 {
 		log.Println("✔️ Tabla de carreras ya tiene datos.")
-		return
+		return nil
 	}
 
 	log.Println("📥 Poblando tabla de carreras desde OpenF1...")
@@ -469,6 +470,7 @@ func autoPopulateSessionsIfNeeded() {
 	}
 
 	log.Printf("✅ %d carreras insertadas en la base de datos.", len(sessions))
+	return nil
 }
 
 func autoPopulatePositionsAndLapsIfNeeded() {
@@ -498,7 +500,7 @@ func autoPopulatePositionsAndLapsIfNeeded() {
 	log.Printf("🔍 Encontradas %d sesiones para procesar", len(sessions))
 
 	// Semáforo para limitar peticiones concurrentes
-	sem := make(chan struct{}, 5)
+	sem := make(chan struct{}, 2)
 	var wg sync.WaitGroup
 
 	// Variables para almacenar resultados
@@ -678,22 +680,38 @@ func getSessionDetail(c *gin.Context) {
 		return
 	}
 
-	// POSICIONES
-	var positions []Position
-	if err := db.Where("session_key = ?", session.SessionKey).Order("position ASC").Find(&positions).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Error al obtener las posiciones"})
+	var driverNums []uint
+	if err := db.
+		Model(&Position{}).
+		Distinct("driver_number").
+		Where("session_key = ?", session.SessionKey).
+		Pluck("driver_number", &driverNums).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Error al listar pilotos en posiciones"})
 		return
 	}
 
-	resultados := []gin.H{}
-	ultimo := Position{}
-	if len(positions) > 0 {
-		ultimo = positions[len(positions)-1]
+	// 2) Para cada piloto, obtenemos su posición final (fecha más reciente)
+	var positions []Position
+	for _, dn := range driverNums {
+		var p Position
+		if err := db.
+			Where("session_key = ? AND driver_number = ?", session.SessionKey, dn).
+			Order("date DESC").
+			First(&p).Error; err != nil {
+			// si algo falla con este piloto, lo saltamos
+			continue
+		}
+		positions = append(positions, p)
 	}
+
+	resultados := []gin.H{}
 
 	// Mapa para rastrear pilotos ya mostrados
 	pilotosMostrados := make(map[uint]bool)
-
+	// Ordenar posiciones por posición ascendente
+	sort.Slice(positions, func(i, j int) bool {
+		return positions[i].Position < positions[j].Position
+	})
 	// Primero mostrar top 3
 	for i := 0; i < 3 && i < len(positions); i++ {
 		p := positions[i]
@@ -709,6 +727,10 @@ func getSessionDetail(c *gin.Context) {
 			"country":  driver.CountryCode,
 		})
 		pilotosMostrados[p.DriverNumber] = true
+	}
+	ultimo := Position{}
+	if len(positions) > 0 {
+		ultimo = positions[len(positions)-1]
 	}
 
 	// Luego mostrar último si no está en el top 3
@@ -798,46 +820,52 @@ func getSeasonSummary(c *gin.Context) {
 	// === VICTORIAS ===
 	var wins []Count
 	db.Raw(`
-		SELECT driver_number, COUNT(*) as count
-		FROM positions
-		WHERE position = 1
-		GROUP BY driver_number
-		ORDER BY count DESC
-		LIMIT 3
-	`).Scan(&wins)
+        SELECT driver_number, COUNT(*) as count
+        FROM positions
+        WHERE position = 1
+        GROUP BY driver_number
+        ORDER BY count DESC
+        LIMIT 3
+    `).Scan(&wins)
 
-	// === VUELTAS RÁPIDAS ===
+	// === VUELTAS RÁPIDAS (fast laps) con CTE + JOIN ===
 	var fastLaps []Count
 	db.Raw(`
-		SELECT driver_number, COUNT(*) as count
-		FROM (
-			SELECT driver_number, session_key, MIN(lap_duration)
-			FROM laps
-			GROUP BY session_key
-		)
-		GROUP BY driver_number
-		ORDER BY count DESC
-		LIMIT 3
-	`).Scan(&fastLaps)
+        WITH best_times AS (
+            SELECT session_key,
+                   MIN(lap_duration) AS best_time
+            FROM laps
+            WHERE lap_duration > 0
+            GROUP BY session_key
+        )
+        SELECT l.driver_number, COUNT(*) AS count
+        FROM laps l
+        JOIN best_times b
+          ON l.session_key = b.session_key
+         AND l.lap_duration = b.best_time
+        GROUP BY l.driver_number
+        ORDER BY count DESC
+        LIMIT 3
+    `).Scan(&fastLaps)
 
-	// === POLES === (posición 1 en la primera fecha de cada sesión)
+	// === POLES ===
 	var poles []Count
 	db.Raw(`
-		SELECT driver_number, COUNT(*) as count
-		FROM positions
-		WHERE position = 1
-		GROUP BY driver_number
-		ORDER BY count DESC
-		LIMIT 3
-	`).Scan(&poles)
+        SELECT driver_number, COUNT(*) as count
+        FROM positions
+        WHERE position = 1
+        GROUP BY driver_number
+        ORDER BY count DESC
+        LIMIT 3
+    `).Scan(&poles)
 
-	// Utilidad para formatear respuesta
+	// Formateo común
 	format := func(cs []Count) []gin.H {
-		var result []gin.H
+		var out []gin.H
 		for i, c := range cs {
 			var d Driver
 			db.First(&d, "driver_number = ?", c.DriverNumber)
-			result = append(result, gin.H{
+			out = append(out, gin.H{
 				"position": i + 1,
 				"driver":   fmt.Sprintf("%s %s", d.FirstName, d.LastName),
 				"team":     d.TeamName,
@@ -845,7 +873,7 @@ func getSeasonSummary(c *gin.Context) {
 				"count":    c.Count,
 			})
 		}
-		return result
+		return out
 	}
 
 	c.JSON(http.StatusOK, gin.H{
@@ -856,70 +884,54 @@ func getSeasonSummary(c *gin.Context) {
 	})
 }
 
-func getDriverPositions(c *gin.Context) {
-	id := c.Param("id")
-
-	// First try to find the driver by driver number
-	var driver Driver
-	if err := db.First(&driver, "driver_number = ?", id).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Piloto no encontrado"})
-		return
-	}
-
-	// Obtener todas las posiciones del piloto
-	var positions []Position
-	if err := db.Where("driver_number = ?", driver.DriverNumber).Find(&positions).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Error al obtener las posiciones"})
-		return
-	}
-
-	// Obtener todas las sesiones de una vez
+func getAllSessions(c *gin.Context) {
 	var sessions []Session
 	if err := db.Find(&sessions).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Error al obtener las sesiones"})
 		return
 	}
 
-	// Crear un mapa de sesiones para acceso rápido
-	sessionsByKey := make(map[int]Session)
-	for _, s := range sessions {
-		sessionsByKey[s.SessionKey] = s
+	c.JSON(http.StatusOK, sessions)
+}
+func getSessionPositions(c *gin.Context) {
+	id := c.Param("id")
+
+	// Convert id to int for session_key lookup
+	sessionKey, err := strconv.Atoi(id)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "ID de sesión inválido"})
+		return
 	}
 
-	// Formatear la respuesta
-	response := gin.H{
-		"driver_id": driver.DriverNumber,
-		"positions": []gin.H{},
+	// Find all positions for the session
+	var positions []Position
+	if err := db.Where("session_key = ?", sessionKey).Order("position ASC").Find(&positions).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Error al obtener las posiciones"})
+		return
 	}
 
-	// Para cada posición, obtener los datos de la sesión
+	// Create response with driver details
+	var response []gin.H
 	for _, pos := range positions {
-		session, exists := sessionsByKey[pos.SessionKey]
-		if !exists {
+		var driver Driver
+		if err := db.First(&driver, "driver_number = ?", pos.DriverNumber).Error; err != nil {
+			log.Printf("Error obteniendo piloto: %v", err)
 			continue
 		}
-
-		// Formatear el nombre de la carrera
-		raceName := fmt.Sprintf("GP de %s", session.CountryName)
-
-		// Agregar posición
-		response["positions"] = append(response["positions"].([]gin.H), gin.H{
-			"session_key":        pos.SessionKey,
-			"circuit_short_name": session.CircuitShortName,
-			"race":               raceName,
-			"position":           pos.Position,
-			"date":               pos.Date,
+		response = append(response, gin.H{
+			"position": pos.Position,
+			"driver":   fmt.Sprintf("%s %s", driver.FirstName, driver.LastName),
+			"team":     driver.TeamName,
+			"country":  driver.CountryCode,
+			"date":     pos.Date,
 		})
 	}
 
-	// Ordenar posiciones por fecha
-	sort.Slice(response["positions"].([]gin.H), func(i, j int) bool {
-		return response["positions"].([]gin.H)[i]["date"].(time.Time).Before(response["positions"].([]gin.H)[j]["date"].(time.Time))
+	c.JSON(http.StatusOK, gin.H{
+		"session_key": sessionKey,
+		"positions":   response,
 	})
-
-	c.JSON(http.StatusOK, response)
 }
-
 func startServer() {
 	initDatabase()
 
@@ -936,7 +948,8 @@ func startServer() {
 		api.GET("/corredor/detalle/:id", getDriverDetail)
 		api.GET("/carrera/detalle/:id", getSessionDetail)
 		api.GET("/temporada/resumen", getSeasonSummary)
-		api.GET("/corredor/posiciones/:id", getDriverPositions)
+		api.GET("/carrera/posiciones", getAllSessions)
+		api.GET("/carrera/posiciones/:id", getSessionPositions)
 	}
 
 	if err := r.Run(":8080"); err != nil {
@@ -947,4 +960,5 @@ func startServer() {
 func main() {
 	fmt.Println("Starting server...")
 	startServer()
+
 }
